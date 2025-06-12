@@ -43,6 +43,7 @@ import (
 
 	"k8s.io/klog/v2"
 	pkgdrivers "k8s.io/minikube/pkg/drivers"
+	"k8s.io/minikube/pkg/drivers/vmnet"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/firewall"
 	"k8s.io/minikube/pkg/minikube/out"
@@ -52,10 +53,12 @@ import (
 )
 
 const (
-	isoFilename    = "boot2docker.iso"
-	pidFileName    = "vfkit.pid"
-	sockFilename   = "vfkit.sock"
-	defaultSSHUser = "docker"
+	isoFilename     = "boot2docker.iso"
+	pidFileName     = "vfkit.pid"
+	sockFilename    = "vfkit.sock"
+	serialFileName  = "serial.log"
+	efiVarsFileName = "vfkit.efivars"
+	defaultSSHUser  = "docker"
 )
 
 // Driver is the machine driver for vfkit (Virtualization.framework)
@@ -66,9 +69,10 @@ type Driver struct {
 	DiskSize       int
 	CPU            int
 	Memory         int
-	Cmdline        string
-	MACAddress     string
 	ExtraDisks     int
+	Network        string        // "", "nat", "vmnet-shared"
+	MACAddress     string        // For network=nat, network=""
+	VmnetHelper    *vmnet.Helper // For network=vmnet-shared
 }
 
 func NewDriver(hostName, storePath string) drivers.Driver {
@@ -136,7 +140,7 @@ func (d *Driver) GetIP() (string, error) {
 	return d.IPAddress, nil
 }
 
-func (d *Driver) GetState() (state.State, error) {
+func (d *Driver) getVfkitState() (state.State, error) {
 	pidfile := d.pidfilePath()
 	pid, err := process.ReadPidfile(pidfile)
 	if err != nil {
@@ -159,6 +163,24 @@ func (d *Driver) GetState() (state.State, error) {
 	return state.Running, nil
 }
 
+func (d *Driver) getVmnetHelperState() (state.State, error) {
+	if d.VmnetHelper == nil {
+		return state.Stopped, nil
+	}
+	return d.VmnetHelper.GetState()
+}
+
+// GetState returns driver state. Since vfkit driver may use 2 processes
+// (vmnet-helper, vfkit), this returns combined state of both processes.
+func (d *Driver) GetState() (state.State, error) {
+	if vfkitState, err := d.getVfkitState(); err != nil {
+		return state.Error, err
+	} else if vfkitState == state.Running {
+		return state.Running, nil
+	}
+	return d.getVmnetHelperState()
+}
+
 func (d *Driver) Create() error {
 	var err error
 	if d.SSHPort, err = d.GetSSHPort(); err != nil {
@@ -166,12 +188,6 @@ func (d *Driver) Create() error {
 	}
 	b2dutils := mcnutils.NewB2dUtils(d.StorePath)
 	if err := b2dutils.CopyIsoToMachineDir(d.Boot2DockerURL, d.MachineName); err != nil {
-		return err
-	}
-	isoPath := d.ResolveStorePath(isoFilename)
-
-	log.Info("Extracting Kernel...")
-	if err := d.extractKernel(isoPath); err != nil {
 		return err
 	}
 
@@ -200,6 +216,33 @@ func (d *Driver) Create() error {
 }
 
 func (d *Driver) Start() error {
+	var socketPath string
+
+	if d.VmnetHelper != nil {
+		socketPath = d.VmnetHelper.SocketPath()
+		if err := d.VmnetHelper.Start(socketPath); err != nil {
+			return err
+		}
+
+		d.MACAddress = d.VmnetHelper.GetMACAddress()
+	}
+
+	if err := d.startVfkit(socketPath); err != nil {
+		return err
+	}
+
+	if err := d.setupIP(d.MACAddress); err != nil {
+		return err
+	}
+
+	log.Infof("Waiting for VM to start (ssh -p %d docker@%s)...", d.SSHPort, d.IPAddress)
+
+	return WaitForTCPWithDelay(fmt.Sprintf("%s:%d", d.IPAddress, d.SSHPort), time.Second)
+}
+
+// startVfkit starts the vfkit child process. If socketPath is not empty, vfkit
+// is connected to the vmnet network via the socket instead of "nat" network.
+func (d *Driver) startVfkit(socketPath string) error {
 	machineDir := filepath.Join(d.StorePath, "machines", d.GetMachineName())
 
 	var startCmd []string
@@ -208,31 +251,39 @@ func (d *Driver) Start() error {
 		"--memory", fmt.Sprintf("%d", d.Memory),
 		"--cpus", fmt.Sprintf("%d", d.CPU),
 		"--restful-uri", fmt.Sprintf("unix://%s", d.sockfilePath()))
-	var isoPath = filepath.Join(machineDir, isoFilename)
-	startCmd = append(startCmd,
-		"--device", fmt.Sprintf("virtio-blk,path=%s", isoPath))
 
-	var mac = d.MACAddress
+	efiVarsPath := d.ResolveStorePath(efiVarsFileName)
 	startCmd = append(startCmd,
-		"--device", fmt.Sprintf("virtio-net,nat,mac=%s", mac))
+		"--bootloader", fmt.Sprintf("efi,variable-store=%s,create", efiVarsPath))
+
+	if socketPath != "" {
+		// The guest will be able to access other guests in the vmnet network.
+		startCmd = append(startCmd,
+			"--device", fmt.Sprintf("virtio-net,unixSocketPath=%s,mac=%s", socketPath, d.MACAddress))
+	} else {
+		// The guest will not be able to access other guests.
+		startCmd = append(startCmd,
+			"--device", fmt.Sprintf("virtio-net,nat,mac=%s", d.MACAddress))
+	}
 
 	startCmd = append(startCmd,
 		"--device", "virtio-rng")
 
+	var isoPath = filepath.Join(machineDir, isoFilename)
 	startCmd = append(startCmd,
-		"--kernel", d.ResolveStorePath("bzimage"))
+		"--device", fmt.Sprintf("virtio-blk,path=%s", isoPath))
+
 	startCmd = append(startCmd,
-		"--kernel-cmdline", d.Cmdline)
-	startCmd = append(startCmd,
-		"--initrd", d.ResolveStorePath("initrd"))
+		"--device", fmt.Sprintf("virtio-blk,path=%s", d.diskPath()))
 
 	for i := 0; i < d.ExtraDisks; i++ {
 		startCmd = append(startCmd,
 			"--device", fmt.Sprintf("virtio-blk,path=%s", pkgdrivers.ExtraDiskPath(d.BaseDriver, i)))
 	}
 
+	serialPath := d.ResolveStorePath(serialFileName)
 	startCmd = append(startCmd,
-		"--device", fmt.Sprintf("virtio-blk,path=%s", d.diskPath()))
+		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", serialPath))
 
 	log.Debugf("executing: vfkit %s", strings.Join(startCmd, " "))
 	os.Remove(d.sockfilePath())
@@ -245,16 +296,7 @@ func (d *Driver) Start() error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	if err := process.WritePidfile(d.pidfilePath(), cmd.Process.Pid); err != nil {
-		return err
-	}
-	if err := d.setupIP(mac); err != nil {
-		return err
-	}
-
-	log.Infof("Waiting for VM to start (ssh -p %d docker@%s)...", d.SSHPort, d.IPAddress)
-
-	return WaitForTCPWithDelay(fmt.Sprintf("%s:%d", d.IPAddress, d.SSHPort), time.Second)
+	return process.WritePidfile(d.pidfilePath(), cmd.Process.Pid)
 }
 
 func (d *Driver) setupIP(mac string) error {
@@ -295,7 +337,7 @@ func isBootpdError(err error) bool {
 	return strings.Contains(err.Error(), "could not find an IP address")
 }
 
-func (d *Driver) Stop() error {
+func (d *Driver) stopVfkit() error {
 	if err := d.SetVFKitState("Stop"); err != nil {
 		// vfkit may be already stopped, shutting down, or not listening.
 		// We don't fallback to "HardStop" since it typically fails due to
@@ -322,6 +364,20 @@ func (d *Driver) Stop() error {
 		}
 	}
 	return nil
+}
+
+func (d *Driver) stopVmnetHelper() error {
+	if d.VmnetHelper == nil {
+		return nil
+	}
+	return d.VmnetHelper.Stop()
+}
+
+func (d *Driver) Stop() error {
+	if err := d.stopVfkit(); err != nil {
+		return err
+	}
+	return d.stopVmnetHelper()
 }
 
 func (d *Driver) Remove() error {
@@ -351,23 +407,7 @@ func (d *Driver) Restart() error {
 	return d.Start()
 }
 
-func (d *Driver) extractKernel(isoPath string) error {
-	for _, f := range []struct {
-		pathInIso string
-		destPath  string
-	}{
-		{"/boot/bzimage", "bzimage"},
-		{"/boot/initrd", "initrd"},
-	} {
-		fullDestPath := d.ResolveStorePath(f.destPath)
-		if err := pkgdrivers.ExtractFile(isoPath, f.pathInIso, fullDestPath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (d *Driver) Kill() error {
+func (d *Driver) killVfkit() error {
 	if err := d.SetVFKitState("HardStop"); err != nil {
 		// Typically fails with EOF due to https://github.com/crc-org/vfkit/issues/277.
 		log.Debugf("Failed to set vfkit state to 'HardStop': %s", err)
@@ -392,6 +432,20 @@ func (d *Driver) Kill() error {
 		}
 	}
 	return nil
+}
+
+func (d *Driver) killVmnetHelper() error {
+	if d.VmnetHelper == nil {
+		return nil
+	}
+	return d.VmnetHelper.Kill()
+}
+
+func (d *Driver) Kill() error {
+	if err := d.killVfkit(); err != nil {
+		return err
+	}
+	return d.killVmnetHelper()
 }
 
 func (d *Driver) StartDocker() error {
@@ -530,7 +584,7 @@ func (d *Driver) SetVFKitState(state string) error {
 	if err != nil {
 		return err
 	}
-	log.Debugf("set state: %+v", vmstate)
+	log.Infof("Set vfkit state: %+v", vmstate)
 	return nil
 }
 

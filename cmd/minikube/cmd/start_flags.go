@@ -30,6 +30,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
+	"k8s.io/minikube/pkg/drivers/vmnet"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil/kverify"
 	"k8s.io/minikube/pkg/minikube/cni"
@@ -60,8 +61,8 @@ const (
 	hostOnlyCIDR            = "host-only-cidr"
 	containerRuntime        = "container-runtime"
 	criSocket               = "cri-socket"
-	networkPlugin           = "network-plugin"
-	enableDefaultCNI        = "enable-default-cni"
+	networkPlugin           = "network-plugin"     // deprecated, use --cni instead
+	enableDefaultCNI        = "enable-default-cni" // deprecated, use --cni=bridge instead
 	cniFlag                 = "cni"
 	hypervVirtualSwitch     = "hyperv-virtual-switch"
 	hypervUseExternalSwitch = "hyperv-use-external-switch"
@@ -162,7 +163,7 @@ func initMinikubeFlags() {
 	startCmd.Flags().Bool(dryRun, false, "dry-run mode. Validates configuration, but does not mutate system state")
 
 	startCmd.Flags().String(cpus, "2", fmt.Sprintf("Number of CPUs allocated to Kubernetes. Use %q to use the maximum number of CPUs. Use %q to not specify a limit (Docker/Podman only)", constants.MaxResources, constants.NoLimit))
-	startCmd.Flags().String(memory, "", fmt.Sprintf("Amount of RAM to allocate to Kubernetes (format: <number>[<unit>], where unit = b, k, m or g). Use %q to use the maximum amount of memory. Use %q to not specify a limit (Docker/Podman only)", constants.MaxResources, constants.NoLimit))
+	startCmd.Flags().StringP(memory, "m", "", fmt.Sprintf("Amount of RAM to allocate to Kubernetes (format: <number>[<unit>], where unit = b, k, m or g). Use %q to use the maximum amount of memory. Use %q to not specify a limit (Docker/Podman only)", constants.MaxResources, constants.NoLimit))
 	startCmd.Flags().String(humanReadableDiskSize, defaultDiskSize, "Disk size allocated to the minikube VM (format: <number>[<unit>], where unit = b, k, m or g).")
 	startCmd.Flags().Bool(downloadOnly, false, "If true, only download and cache files for later use - don't install or start anything.")
 	startCmd.Flags().Bool(cacheImages, true, "If true, cache docker images for the current bootstrapper and load them into the machine. Always false with --driver=none.")
@@ -197,10 +198,10 @@ func initMinikubeFlags() {
 	startCmd.Flags().Bool(noKubernetes, false, "If set, minikube VM/container will start without starting or configuring Kubernetes. (only works on new clusters)")
 	startCmd.Flags().Bool(deleteOnFailure, false, "If set, delete the current cluster if start fails and try again. Defaults to false.")
 	startCmd.Flags().Bool(forceSystemd, false, "If set, force the container runtime to use systemd as cgroup manager. Defaults to false.")
-	startCmd.Flags().String(network, "", "network to run minikube with. Now it is used by docker/podman and KVM drivers. If left empty, minikube will create a new network.")
+	startCmd.Flags().String(network, "", "network to run minikube with. Used by docker/podman, qemu, kvm, and vfkit drivers. If left empty, minikube will create a new network.")
 	startCmd.Flags().StringVarP(&outputFormat, "output", "o", "text", "Format to print stdout in. Options include: [text,json]")
 	startCmd.Flags().String(trace, "", "Send trace events. Options include: [gcp]")
-	startCmd.Flags().Int(extraDisks, 0, "Number of extra disks created and attached to the minikube VM (currently only implemented for hyperkit, kvm2, and qemu2 drivers)")
+	startCmd.Flags().Int(extraDisks, 0, "Number of extra disks created and attached to the minikube VM (currently only implemented for hyperkit, kvm2, qemu2, and vfkit drivers)")
 	startCmd.Flags().Duration(certExpiration, constants.DefaultCertExpiration, "Duration until minikube certificate expiration, defaults to three years (26280h).")
 	startCmd.Flags().String(binaryMirror, "", "Location to fetch kubectl, kubelet, & kubeadm binaries from.")
 	startCmd.Flags().Bool(disableOptimizations, false, "If set, disables optimizations that are set for local Kubernetes. Including decreasing CoreDNS replicas from 2 to 1. Defaults to false.")
@@ -231,6 +232,20 @@ func initKubernetesFlags() {
 func initDriverFlags() {
 	startCmd.Flags().StringP("driver", "d", "", fmt.Sprintf("Driver is one of: %v (defaults to auto-detect)", driver.DisplaySupportedDrivers()))
 	startCmd.Flags().String("vm-driver", "", "DEPRECATED, use `driver` instead.")
+	// Hide the deprecated vm-driver flag from help text
+	if err := startCmd.Flags().MarkHidden("vm-driver"); err != nil {
+		klog.Warningf("Failed to hide vm-driver flag: %v\n", err)
+	}
+	// Hide the deprecated flag from help text so new users dont use it (still will be processed)
+	if err := startCmd.Flags().MarkHidden(enableDefaultCNI); err != nil {
+		klog.Warningf("Failed to hide %s flag: %v\n", enableDefaultCNI, err)
+	}
+
+	// Hide the deprecated flag from help text so new users dont use it (still will be processed)
+	if err := startCmd.Flags().MarkHidden(networkPlugin); err != nil {
+		klog.Warningf("Failed to hide %s flag: %v\n", networkPlugin, err)
+	}
+
 	startCmd.Flags().Bool(disableDriverMounts, false, "Disables the filesystem mounts provided by the hypervisors")
 	startCmd.Flags().Bool("vm", false, "Filter to use only VM Drivers")
 
@@ -469,9 +484,15 @@ func getCNIConfig(cmd *cobra.Command) string {
 
 func getNetwork(driverName string) string {
 	n := viper.GetString(network)
-	if !driver.IsQEMU(driverName) {
-		return n
+	if driver.IsQEMU(driverName) {
+		return validateQemuNetwork(n)
+	} else if driver.IsVFKit(driverName) {
+		return validateVfkitNetwork(n)
 	}
+	return n
+}
+
+func validateQemuNetwork(n string) string {
 	switch n {
 	case "socket_vmnet":
 		if runtime.GOOS != "darwin" {
@@ -503,6 +524,28 @@ func getNetwork(driverName string) string {
 	return n
 }
 
+func validateVfkitNetwork(n string) string {
+	if runtime.GOOS != "darwin" {
+		exit.Message(reason.Usage, "The vfkit driver is only supported on macOS")
+	}
+	switch n {
+	case "nat":
+		// always available
+	case "vmnet-shared":
+		// "vment-shared" provides access between machines, with lower performance compared to "nat".
+		if err := vmnet.ValidateHelper(); err != nil {
+			vmnetErr := err.(*vmnet.Error)
+			exit.Message(vmnetErr.Kind, "failed to validate {{.network}} network: {{.reason}}", out.V{"network": n, "reason": err})
+		}
+	case "":
+		// Default to nat since it is always available and provides the best performance.
+		n = "nat"
+	default:
+		exit.Message(reason.Usage, "--network with vfkit must be 'nat' or 'vmnet-shared'")
+	}
+	return n
+}
+
 // generateNewConfigFromFlags generate a config.ClusterConfig based on flags
 func generateNewConfigFromFlags(cmd *cobra.Command, k8sVersion string, rtime string, drvName string) config.ClusterConfig {
 	var cc config.ClusterConfig
@@ -513,8 +556,8 @@ func generateNewConfigFromFlags(cmd *cobra.Command, k8sVersion string, rtime str
 		out.WarningT("With --network-plugin=cni, you will need to provide your own CNI. See --cni flag as a user-friendly alternative")
 	}
 
-	if !(driver.IsKIC(drvName) || driver.IsKVM(drvName) || driver.IsQEMU(drvName)) && viper.GetString(network) != "" {
-		out.WarningT("--network flag is only valid with the docker/podman, KVM and Qemu drivers, it will be ignored")
+	if viper.GetString(network) != "" && !driver.SupportsNetworkFlag(drvName) {
+		out.WarningT("--network flag is only valid with the docker/podman, qemu, kvm, and vfkit drivers, it will be ignored")
 	}
 
 	validateHANodeCount(cmd)
